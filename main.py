@@ -1,8 +1,10 @@
 from pathlib import Path
 import argparse
+import hashlib
 import json
 import os
 import re
+from collections import defaultdict
 from typing import Any
 
 import faiss
@@ -25,6 +27,11 @@ EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 LLM_MODEL_NAME = "gemini-2.5-flash"
 INDEX_DIR = "rag_store"
 SIMILARITY_THRESHOLD = 0.28
+
+
+def _content_fingerprint(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def looks_meaningful(text: str) -> bool:
@@ -50,15 +57,51 @@ def looks_meaningful(text: str) -> bool:
     return True
 
 
-def load_documents():
-    documents = []
+def load_documents() -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
+    documents: list[dict[str, str]] = []
+    unreadable_docs: list[dict[str, str]] = []
+    duplicate_docs: list[dict[str, str]] = []
     folder = Path("documents")
+    seen_fingerprints: dict[str, str] = {}
 
-    for file in folder.glob("*.md"):
-        text = file.read_text(encoding="utf-8")
-        documents.append({"filename": file.name, "content": text})
+    if not folder.exists():
+        return [], [{"filename": "documents/", "reason": "Documents folder does not exist."}], []
 
-    return sorted(documents, key=lambda d: d["filename"].lower())
+    for file in sorted(folder.glob("*.md"), key=lambda p: p.name.lower()):
+        try:
+            text = file.read_text(encoding="utf-8")
+        except Exception as exc:
+            unreadable_docs.append(
+                {
+                    "filename": file.name,
+                    "reason": f"Could not read file: {exc}",
+                }
+            )
+            continue
+
+        if not text.strip():
+            unreadable_docs.append(
+                {
+                    "filename": file.name,
+                    "reason": "File is empty.",
+                }
+            )
+            continue
+
+        fingerprint = _content_fingerprint(text)
+        if fingerprint in seen_fingerprints:
+            duplicate_docs.append(
+                {
+                    "filename": file.name,
+                    "reason": f"Duplicate content of {seen_fingerprints[fingerprint]}",
+                }
+            )
+            continue
+
+        seen_fingerprints[fingerprint] = file.name
+        documents.append({"filename": file.name, "content": text, "doc_hash": fingerprint})
+
+    return documents, unreadable_docs, duplicate_docs
 
 
 def split_markdown_into_chunks(
@@ -127,14 +170,31 @@ def filter_documents(documents: list[dict[str, str]]) -> tuple[list[dict[str, st
     return kept_docs, filtered_docs
 
 
-def build_chunks(kept_docs: list[dict[str, str]]) -> list[dict[str, Any]]:
+def build_chunks(kept_docs: list[dict[str, str]]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     all_chunks = []
+    chunk_warnings: list[dict[str, str]] = []
     for doc in kept_docs:
-        all_chunks.extend(split_markdown_into_chunks(doc["content"], doc["filename"]))
-    return all_chunks
+        chunks = split_markdown_into_chunks(doc["content"], doc["filename"])
+        if not chunks:
+            chunk_warnings.append(
+                {
+                    "filename": doc["filename"],
+                    "reason": "No chunks created (document too short or malformed).",
+                }
+            )
+            continue
+
+        for i, chunk in enumerate(chunks, start=1):
+            chunk["chunk_id"] = f"{doc['filename']}::chunk-{i}"
+            chunk["doc_hash"] = doc.get("doc_hash", "")
+            all_chunks.append(chunk)
+    return all_chunks, chunk_warnings
 
 
 def build_faiss_index(chunks: list[dict], model_name: str = EMBED_MODEL_NAME):
+    if not chunks:
+        raise ValueError("Cannot build index: no chunks were generated.")
+
     model = SentenceTransformer(model_name)
     texts = [chunk["content"] for chunk in chunks]
 
@@ -150,7 +210,12 @@ def build_faiss_index(chunks: list[dict], model_name: str = EMBED_MODEL_NAME):
     return index, model
 
 
-def save_index_and_metadata(index, chunks: list[dict], output_dir: str = INDEX_DIR):
+def save_index_and_metadata(
+    index,
+    chunks: list[dict],
+    output_dir: str = INDEX_DIR,
+    ingestion_report: dict[str, Any] | None = None,
+):
     store_dir = Path(output_dir)
     store_dir.mkdir(parents=True, exist_ok=True)
 
@@ -158,6 +223,10 @@ def save_index_and_metadata(index, chunks: list[dict], output_dir: str = INDEX_D
 
     with open(store_dir / "chunks.json", "w", encoding="utf-8") as f:
         json.dump(chunks, f, ensure_ascii=False, indent=2)
+
+    if ingestion_report is not None:
+        with open(store_dir / "ingestion_report.json", "w", encoding="utf-8") as f:
+            json.dump(ingestion_report, f, ensure_ascii=False, indent=2)
 
 
 def load_index_and_metadata(output_dir: str = INDEX_DIR):
@@ -211,6 +280,45 @@ def build_context(results: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def build_document_summaries(question: str, results: list[dict[str, Any]], max_docs: int = 3) -> list[dict[str, str]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for result in results:
+        grouped[result["filename"]].append(result)
+
+    ranked_docs: list[tuple[float, str, list[dict[str, Any]]]] = []
+    for filename, doc_results in grouped.items():
+        doc_score = max(r["score"] for r in doc_results)
+        ranked_docs.append((doc_score, filename, doc_results))
+    ranked_docs.sort(key=lambda x: x[0], reverse=True)
+
+    summaries: list[dict[str, str]] = []
+    for _, filename, doc_results in ranked_docs[:max_docs]:
+        # Document-level summary is built from multiple chunks in the same document.
+        merged = " ".join(r.get("content", "") for r in doc_results[:3]).strip()
+        summary = _pick_best_preview(question, merged, max_sentences=3)
+        sections = sorted({r.get("section", "").strip() for r in doc_results if r.get("section", "").strip()})
+        summaries.append(
+            {
+                "filename": filename,
+                "summary": _clean_preview_text(summary),
+                "sections": ", ".join(sections[:4]) if sections else "No section",
+            }
+        )
+    return summaries
+
+
+def build_document_summary_context(document_summaries: list[dict[str, str]]) -> str:
+    parts: list[str] = []
+    for i, summary in enumerate(document_summaries, start=1):
+        parts.append(
+            (
+                f"[DOC {i}] file={summary['filename']} | sections={summary['sections']}\n"
+                f"{summary['summary']}"
+            )
+        )
+    return "\n\n".join(parts)
+
+
 def generate_answer_with_llm(question: str, results: list[dict[str, Any]], model_name: str) -> str:
     if google_genai is None:
         raise RuntimeError("google-genai package is not installed. Run: pip install google-genai")
@@ -221,6 +329,8 @@ def generate_answer_with_llm(question: str, results: list[dict[str, Any]], model
 
     client = google_genai.Client(api_key=api_key)
     context = build_context(results)
+    document_summaries = build_document_summaries(question, results)
+    document_context = build_document_summary_context(document_summaries)
 
     system_prompt = (
         "You are a careful assistant answering questions strictly from provided internal documents. "
@@ -229,12 +339,14 @@ def generate_answer_with_llm(question: str, results: list[dict[str, Any]], model
     )
     user_prompt = (
         f"Question:\n{question}\n\n"
+        f"Document summaries:\n{document_context}\n\n"
         f"Context documents:\n{context}\n\n"
         "Instructions:\n"
         "1) Answer only using context.\n"
-        "2) Keep answer concise and practical.\n"
-        "3) If not found, clearly state it's not available in documents.\n"
-        "4) Do NOT include a Sources line — sources are displayed separately.\n"
+        "2) Prefer document-level understanding from summaries, then verify with chunks.\n"
+        "3) Keep answer concise and practical.\n"
+        "4) If not found, clearly state it's not available in documents.\n"
+        "5) Do NOT include a Sources line — sources are displayed separately.\n"
     )
 
     response = client.models.generate_content(
@@ -410,72 +522,100 @@ def extractive_fallback_answer(question: str, results: list[dict[str, Any]]) -> 
     if not _fallback_relevance_ok(question, results):
         return "The information is not available in the documents."
 
-    evidence = _pick_fallback_evidence(question, results, max_items=2)
-    previews: list[str] = []
-    sources: list[str] = []
-    for i, ev in enumerate(evidence, start=1):
-        preview = _clean_preview_text(ev["content"])
-        if not preview:
-            preview = ev["content"][:500].replace("\n", " ").strip()
-        previews.append(preview)
-        sources.append(f"[{i}] {ev['filename']} ({ev['section']})")
+    evidence = _pick_fallback_evidence(question, results, max_items=4)
+    document_summaries = build_document_summaries(question, evidence, max_docs=2)
+    if not document_summaries:
+        return "The information is not available in the documents."
 
-    if len(previews) == 1:
-        answer_text = previews[0]
+    sources: list[str] = []
+    for i, summary in enumerate(document_summaries, start=1):
+        sources.append(f"[{i}] {summary['filename']} ({summary['sections']})")
+
+    if len(document_summaries) == 1:
+        answer_text = document_summaries[0]["summary"]
     else:
-        answer_text = "\n".join(f"- {p}" for p in previews)
+        answer_text = "\n".join(
+            f"- {summary['filename']}: {summary['summary']}" for summary in document_summaries
+        )
 
     return f"{answer_text}\nSources: " + ", ".join(sources)
 
 
 def run_index_flow() -> None:
     print("[LOG] Step 1/5: Loading markdown documents...")
-    docs = load_documents()
+    docs, unreadable_docs, duplicate_docs = load_documents()
 
     print("[LOG] Step 2/5: Filtering noisy/rubbish files...")
     kept_docs, filtered_docs = filter_documents(docs)
 
     print("[LOG] Step 3/5: Chunking kept documents...")
-    all_chunks = build_chunks(kept_docs)
+    all_chunks, chunk_warnings = build_chunks(kept_docs)
 
     print("[LOG] Step 4/5: Building embeddings + FAISS index...")
     index, _ = build_faiss_index(all_chunks)
 
     print("[LOG] Step 5/5: Saving index + chunk metadata...")
-    save_index_and_metadata(index, all_chunks, output_dir=INDEX_DIR)
+    ingestion_report = {
+        "loaded_docs": len(docs),
+        "kept_docs": len(kept_docs),
+        "filtered_docs": len(filtered_docs),
+        "duplicates": duplicate_docs,
+        "unreadable_or_empty": unreadable_docs,
+        "chunk_warnings": chunk_warnings,
+    }
+    save_index_and_metadata(
+        index,
+        all_chunks,
+        output_dir=INDEX_DIR,
+        ingestion_report=ingestion_report,
+    )
 
     print("\nIndex build complete.")
     print(f"Loaded docs: {len(docs)}")
     print(f"Kept docs: {len(kept_docs)}")
     print(f"Filtered docs: {len(filtered_docs)}")
+    print(f"Duplicates skipped: {len(duplicate_docs)}")
+    print(f"Unreadable/empty skipped: {len(unreadable_docs)}")
+    print(f"Docs with chunk warnings: {len(chunk_warnings)}")
     print(f"Total chunks: {len(all_chunks)}")
     if filtered_docs:
         print("Filtered files:", ", ".join(d["filename"] for d in filtered_docs))
+    if duplicate_docs:
+        print("Duplicate files:", ", ".join(d["filename"] for d in duplicate_docs))
+    if unreadable_docs:
+        print("Unreadable/empty files:", ", ".join(d["filename"] for d in unreadable_docs))
+    if chunk_warnings:
+        print("Chunk warnings for files:", ", ".join(d["filename"] for d in chunk_warnings))
 
 
-def run_ask_flow(question: str, top_k: int, llm_model: str) -> None:
-    print("[LOG] Step 1/5: Loading FAISS index and chunk metadata...")
-    index, chunks, embed_model = load_index_and_metadata(output_dir=INDEX_DIR)
-
-    print("[LOG] Step 2/5: Running semantic retrieval...")
+def answer_question(
+    question: str,
+    index,
+    chunks: list[dict[str, Any]],
+    embed_model,
+    top_k: int = 5,
+    llm_model: str = LLM_MODEL_NAME,
+) -> dict[str, Any]:
+    step_log: list[str] = ["Step 1/4: Running semantic retrieval"]
     results = search(question, index, embed_model, chunks, top_k=top_k)
 
-    print("[LOG] Step 3/5: Evaluating retrieval confidence...")
+    step_log.append("Step 2/4: Evaluating retrieval confidence")
     if not results or results[0]["score"] < SIMILARITY_THRESHOLD:
-        print("Answer: The information is not available in the documents.")
-        print("Sources: none")
-        return
+        return {
+            "answer": "The information is not available in the documents.",
+            "results": results,
+            "sources": [],
+            "step_log": step_log,
+            "used_fallback": True,
+        }
 
-    print("[LOG] Step 4/5: Generating grounded answer...")
+    step_log.append("Step 3/4: Generating grounded answer")
+    used_fallback = False
     try:
         answer = generate_answer_with_llm(question, results, model_name=llm_model)
-    except Exception as exc:
-        print(f"[LOG] Gemini unavailable ({exc}). Using extractive fallback.")
+    except Exception:
+        used_fallback = True
         answer = extractive_fallback_answer(question, results)
-
-    print("[LOG] Step 5/5: Displaying answer and sources...")
-    print("\nQuestion:", question)
-    print("Answer:", answer)
 
     unique_sources = []
     seen = set()
@@ -483,10 +623,41 @@ def run_ask_flow(question: str, top_k: int, llm_model: str) -> None:
         key = (r["filename"], r["section"])
         if key not in seen:
             seen.add(key)
-            unique_sources.append(key)
+            unique_sources.append({"filename": r["filename"], "section": r["section"]})
+
+    step_log.append("Step 4/4: Done")
+    return {
+        "answer": answer,
+        "results": results,
+        "sources": unique_sources,
+        "step_log": step_log,
+        "used_fallback": used_fallback,
+    }
+
+
+def run_ask_flow(question: str, top_k: int, llm_model: str) -> None:
+    print("[LOG] Step 1/5: Loading FAISS index and chunk metadata...")
+    index, chunks, embed_model = load_index_and_metadata(output_dir=INDEX_DIR)
+    response = answer_question(
+        question=question,
+        index=index,
+        chunks=chunks,
+        embed_model=embed_model,
+        top_k=top_k,
+        llm_model=llm_model,
+    )
+    print("[LOG] Step 2/5: Retrieval and answer generation completed.")
+    print("\nQuestion:", question)
+    print("Answer:", response["answer"])
+    if response["used_fallback"]:
+        print("[LOG] Fallback mode used (LLM unavailable or disabled).")
 
     print("\nRetrieved sources:")
-    for fname, section in unique_sources:
+    if not response["sources"]:
+        print("- none")
+    for source in response["sources"]:
+        fname = source["filename"]
+        section = source["section"]
         label = section if section else "No section"
         print(f"- {fname} ({label})")
 

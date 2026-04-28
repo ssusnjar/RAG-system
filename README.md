@@ -5,11 +5,14 @@ A small AI system that answers questions based on internal company documents (po
 ## Features
 
 - Loads and filters `.md` documents from `documents/`
+- Handles unreadable/empty/duplicate documents during ingestion
 - Automatically excludes noisy/rubbish files (symbol-heavy or repetitive gibberish)
 - Splits documents into chunks (heading-aware, with overlap)
 - Embeds chunks using `sentence-transformers` (`all-MiniLM-L6-v2`)
 - Stores vectors in a FAISS index for fast similarity search
+- Stores an ingestion report (`rag_store/ingestion_report.json`) for traceability
 - Answers questions grounded strictly in the documents
+- Builds document-level summaries from multiple retrieved chunks before final answering
 - States which documents and sections were used (sources/citations)
 - Clearly states when information is not available in the documents
 - Displays a short step-by-step log of what the system did
@@ -198,3 +201,17 @@ In a production setting, this would be addressed at the document ingestion level
 **Why:**
 - OpenAI requires a paid API key. Gemini offers a free tier sufficient for this project's scale.
 - `.env` file support makes setup simpler and avoids needing to set environment variables manually before each run.
+
+### 7) More robust ingestion + cleaner answer architecture
+
+**What was added/changed:**
+- Ingestion now handles unreadable files, empty files, and duplicate-content files using content fingerprinting.
+- The index build now writes `rag_store/ingestion_report.json` with skipped-file reasons and chunking warnings.
+- Added a central `answer_question(...)` orchestration function used by both CLI and UI so retrieval/confidence/answering logic is no longer duplicated.
+- Answer generation now includes document-level summaries (combined from multiple chunks of the same document), instead of relying only on single chunk snippets.
+
+**Why:**
+- Prevents silent ingestion failures that previously made some documents unavailable at query time.
+- Makes debugging and QA easier by exposing ingestion decisions explicitly.
+- Improves code organization (clearer layer separation between retrieval and answering).
+- Improves answer quality for broader questions by summarizing at document level, not only chunk level.
