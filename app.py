@@ -2,11 +2,9 @@ from typing import List, Tuple
 
 import gradio as gr
 
-from main import (
-    INDEX_DIR,
-    answer_question,
-    load_index_and_metadata,
-)
+from rag.config import INDEX_DIR
+from rag.pipeline import answer_question
+from rag.retrieval import load_index_and_metadata
 
 
 INDEX, CHUNKS, EMBED_MODEL = None, None, None

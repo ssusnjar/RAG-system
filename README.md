@@ -62,8 +62,14 @@ Without the key, the system uses an extractive fallback (returns the most releva
 
 ```
 RAG-system/
-├── main.py            # Core pipeline: ingest, filter, chunk, embed, index, search, answer
+├── main.py            # Thin CLI entrypoint (`index`, `ask`)
 ├── app.py             # Gradio web UI
+├── rag/
+│   ├── config.py      # Shared config/constants + .env loading
+│   ├── ingestion.py   # Document loading, filtering, chunking
+│   ├── retrieval.py   # Embedding, FAISS index I/O, semantic search
+│   ├── answering.py   # LLM prompting + extractive fallback logic
+│   └── pipeline.py    # Orchestration flows used by CLI and UI
 ├── requirements.txt   # Python dependencies
 ├── .env.example       # Example environment variables for Gemini API
 ├── documents/         # Source markdown files (policies, procedures)
@@ -147,7 +153,7 @@ In a production setting, this would be addressed at the document ingestion level
 - End users should see a clean answer, not internal pipeline traces.
 - Debug information is still available for development without cluttering the interface.
 
-### 2) Smarter extractive fallback in `main.py`
+### 2) Smarter extractive fallback in `rag/answering.py`
 
 **What was added/changed:**
 - Added token-based helpers to pick the most question-relevant retrieved chunk.
@@ -196,7 +202,7 @@ In a production setting, this would be addressed at the document ingestion level
 - Replaced the OpenAI SDK with `google-genai` for LLM answer generation.
 - The default model is `gemini-2.5-flash` (free tier, no billing required).
 - Added `.env` support via `python-dotenv` so the API key is loaded automatically from a `.env` file instead of requiring manual shell environment setup.
-- The LLM model name is defined as a constant in `main.py` (`LLM_MODEL_NAME`) rather than in `.env`, since it is not sensitive.
+- The LLM model name is defined as a constant in `rag/config.py` (`LLM_MODEL_NAME`) rather than in `.env`, since it is not sensitive.
 
 **Why:**
 - OpenAI requires a paid API key. Gemini offers a free tier sufficient for this project's scale.
